@@ -1,63 +1,176 @@
-const WebSocket = require('ws');
+const WebSocket = require("ws");
 
 const server = new WebSocket.Server({
   port: process.env.PORT || 8080,
-  host: '0.0.0.0'
+  host: "0.0.0.0",
 });
 const clients = new Map();
 
-server.on('connection', (socket) => {
-    console.log('Client connected');
+server.on("connection", (ws) => {
+  ws.on("pong", () => (ws.isAlive = true));
 
-    socket.isAlive = true;
-
-    socket.on('pong', () => {
-        socket.isAlive = true;
-    });
-
-    socket.once('message', (nameBuffer) => {
-        const name = nameBuffer.toString('utf8');
-        clients.set(name, socket);
-        console.log(`${name} joined`);
-
-        socket.on('message', (msgBuffer) => {
-            const msg = msgBuffer.toString('utf8');
-            const [targetName, ...messageParts] = msg.split(':');
-            const message = messageParts.join(':').trim();
-
-            const targetSocket = clients.get(targetName);
-            if (targetSocket) {
-                targetSocket.send(`${name} sent: ${message}`);
-            } else {
-                socket.send(`User ${targetName} not found`);
-            }
-        });
-    });
-
-    socket.on('close', () => {
-        for (const [name, s] of clients.entries()) {
-            if (s === socket) {
-                clients.delete(name);
-                console.log(`${name} disconnected`);
-                break;
-            }
+  ws.on("message", (data, isBinary) => {
+    if (!ws.clientId && !isBinary) {
+      try {
+        const json = JSON.parse(data.toString());
+        if (json.type === "init" && json.clientId) {
+          ws.clientId = json.clientId;
+          registerClient(ws.clientId, ws);
+          return;
         }
-    });
+      } catch (e) {
+        console.warn("Invalid init JSON:", e.message);
+        return;
+      }
+    }
+
+    if (ws.clientId) {
+      handleClientMessage(ws.clientId, data, isBinary);
+    }
+  });
+
+  ws.on("close", () => {
+    handleClientClose(ws.clientId);
+  });
 });
 
-setInterval(() => {
-    for (const [name, socket] of clients.entries()) {
-        if (!socket.isAlive) {
-            console.log(`${name} is not responding. Terminating...`);
-            socket.terminate();
-            clients.delete(name);
-            console.log(`${name} disconnected (timeout)`);
-            continue;
-        }
+function registerClient(clientId, ws) {
+  const client = { ws, isMicOn: false };
+  clients.set(clientId, client);
+  ws.isAlive = true;
 
-        socket.isAlive = false;
-        socket.ping();
+  const existingClients = [];
+  for (const [id, otherClient] of clients.entries()) {
+    if (id !== clientId) {
+      existingClients.push({
+        clientId: id,
+        isMicOn: otherClient.isMicOn,
+      });
     }
+  }
+
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(
+      JSON.stringify({
+        type: "client_list",
+        clients: existingClients,
+      })
+    );
+  }
+
+  broadcast(
+    {
+      type: "client_status",
+      clientId,
+      status: "connected",
+    },
+    clientId
+  );
+}
+
+function handleClientMessage(clientId, data, isBinary) {
+  const client = clients.get(clientId);
+  if (!client) return;
+
+  try {
+    if (isBinary) {
+      if (!client.isMicOn) {
+        client.isMicOn = true;
+        broadcast(
+          {
+            type: "mic_status",
+            clientId,
+            isMicOn: true,
+          },
+          clientId
+        );
+      }
+
+      const idBuffer = Buffer.alloc(4);
+      idBuffer.writeUInt32BE(clientId);
+      const combined = Buffer.concat([idBuffer, data]);
+
+      broadcast(combined, clientId);
+      return;
+    }
+
+    const str = data.toString();
+    const json = JSON.parse(str);
+
+    switch (json.type) {
+      case "mic_status":
+        if (typeof json.isMicOn === "boolean") {
+          client.isMicOn = json.isMicOn;
+          broadcast(
+            {
+              type: "mic_status",
+              clientId,
+              isMicOn: client.isMicOn,
+            },
+            clientId
+          );
+        }
+        break;
+
+      case "text_message":
+        broadcast(
+          {
+            type: "text_message",
+            clientId,
+            message: json.message,
+          },
+          clientId
+        );
+        break;
+
+      default:
+        console.warn("Unknown message type:", json.type);
+        break;
+    }
+  } catch (e) {
+    console.error("Error parsing message:", e.message);
+  }
+}
+
+function handleClientClose(clientId) {
+  clients.delete(clientId);
+  broadcast({
+    type: "client_status",
+    clientId,
+    status: "disconnected",
+  });
+}
+
+function broadcast(data, excludeClientId = null) {
+  const isBinary = Buffer.isBuffer(data);
+  const message = isBinary
+    ? data
+    : typeof data === "string"
+    ? data
+    : JSON.stringify(data);
+
+  if (!isBinary) {
+    console.log("📣 broadcast (text):", message);
+  }
+
+  for (const [id, client] of clients.entries()) {
+    if (id !== excludeClientId && client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(message);
+    }
+  }
+}
+
+setInterval(() => {
+  for (const [id, client] of clients.entries()) {
+    if (!client.ws.isAlive) {
+      console.warn(`Client ${id} is unresponsive`);
+      client.ws.terminate();
+      handleClientClose(id);
+    } else {
+      client.ws.isAlive = false;
+      client.ws.ping();
+    }
+  }
 }, 15000);
 
-console.log('🟢 WebSocket server running on ws://localhost:8080');
+console.log("✅ WebSocket server running");
